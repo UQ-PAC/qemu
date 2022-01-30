@@ -311,3 +311,8 @@ option('profiler', type: 'boolean', value: false,
        description: 'profiler support')
 option('slirp_smbd', type : 'feature', value : 'auto',
        description: 'use smbd (at path --smbd=*) in slirp networking')
+
+option('tracewrap', type : 'boolean', value : false,
+       description: 'tracewrap (bap-frames) compression support')
+option('tracewrap_dir', type : 'string', value : '',
+       description: 'path to bap-frames')

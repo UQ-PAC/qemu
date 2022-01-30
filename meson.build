@@ -2789,6 +2789,8 @@ config_host_data.set('CONFIG_CAPSTONE', capstone.found())
 config_host_data.set('CONFIG_FDT', fdt.found())
 config_host_data.set('CONFIG_SLIRP', slirp.found())
 
+config_host_data.set('HAS_TRACEWRAP', get_option('tracewrap'))
+
 #####################
 # Generated sources #
 #####################
@@ -3114,6 +3116,12 @@ if have_block
 endif
 
 common_ss.add(files('cpus-common.c'))
+
+if get_option('tracewrap')
+  subdir('protobuf')
+  specific_ss.add('tracewrap.c')
+  specific_ss.add(protoframes)
+endif
 
 subdir('softmmu')
 
@@ -3991,6 +3999,7 @@ summary_info += {'libudev':           libudev}
 # Dummy dependency, keep .found()
 summary_info += {'FUSE lseek':        fuse_lseek.found()}
 summary_info += {'selinux':           selinux}
+summary_info += {'tracewrap':         get_option('tracewrap')}
 summary(summary_info, bool_yn: true, section: 'Dependencies')
 
 if not supported_cpus.contains(cpu)
