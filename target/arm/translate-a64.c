@@ -370,6 +370,84 @@ static void gen_step_complete_exception(DisasContext *s)
     s->base.is_jmp = DISAS_NORETURN;
 }
 
+#ifdef HAS_TRACEWRAP
+
+static void gen_trace_load_reg_var(int reg, TCGv_i64 var)
+{
+    TCGv_i32 t = tcg_const_i32(reg);
+    gen_helper_trace_load_reg64(t, var);
+    tcg_temp_free_i32(t);
+}
+
+static void gen_trace_store_reg_var(int reg, TCGv_i64 var)
+{
+    TCGv_i32 t = tcg_const_i32(reg);
+    gen_helper_trace_store_reg64(t, var);
+    tcg_temp_free_i32(t);
+}
+
+/*
+ * sp indicates whether reg == 31 means sp (cpu_reg_sp() was used)
+ * instead of zr (cpu_reg() was used)
+ */
+static void gen_trace_load_reg(int reg, bool sp)
+{
+    if (!sp && reg == 31) {
+        return;
+    }
+    gen_trace_load_reg_var(reg, cpu_X[reg]);
+}
+
+/*
+ * sp has same meaning as above
+ */
+static void gen_trace_store_reg(int reg, bool sp)
+{
+    if (!sp && reg == 31) {
+        return;
+    }
+    gen_trace_store_reg_var(reg, cpu_X[reg]);
+}
+
+/*
+ * This is to record memory accesses for atomic instructions. Because those are actually implemented
+ * in helpers, we don't have access to the actual values being read or written (unless we modify the helpers
+ * in the future) and instead we pre- or re-read from memory here.
+ * Thus, this can only work reliably without concurrency at the moment, hence the warning.
+ */
+static void gen_trace_mem_access_atomic(TCGv_i64 addr, TCGArg memidx, MemOp mop, bool write)
+{
+    qemu_log("Warning: using non-atomic memory access for trace operands of atomic instruction!\n");
+    TCGv_i64 valt = tcg_temp_new_i64();
+    tcg_gen_qemu_ld_i64(valt, addr, memidx, mop);
+    TCGv_i32 mopt = tcg_const_i32(mop);
+    (write ? gen_helper_trace_st64_64 : gen_helper_trace_ld64_64)(cpu_env, valt, addr, mopt);
+    tcg_temp_free_i32(mopt);
+    tcg_temp_free_i64(valt);
+}
+
+static inline void gen_trace_newframe(DisasContext *s)
+{
+    TCGv_i64 t = tcg_const_i64(s->pc_curr);
+    gen_helper_trace_newframe_64(t);
+    tcg_temp_free_i64(t);
+    trace_cpsr_reset();
+}
+
+static inline void gen_trace_endframe(DisasContext *s)
+{
+    gen_trace_flush_cpsr();
+    TCGv_i64 tmp0 = tcg_temp_new_i64();
+    tcg_gen_movi_i64(tmp0, s->pc_curr);
+    gen_helper_trace_endframe_64(cpu_env, tmp0);
+    tcg_temp_free_i64(tmp0);
+}
+#else //HAS_TRACEWRAP
+static inline void gen_trace_load_reg(int reg, bool sp) {}
+static inline void gen_trace_store_reg(int reg, bool sp) {}
+static inline void gen_trace_mem_access_atomic(TCGv_i64 addr, TCGArg memidx, MemOp mop, bool write) {}
+#endif //HAS_TRACEWRAP
+
 static inline bool use_goto_tb(DisasContext *s, uint64_t dest)
 {
     if (s->ss_active) {
@@ -380,6 +458,9 @@ static inline bool use_goto_tb(DisasContext *s, uint64_t dest)
 
 static inline void gen_goto_tb(DisasContext *s, int n, uint64_t dest)
 {
+#ifdef HAS_TRACEWRAP
+    gen_trace_endframe(s);
+#endif
     if (use_goto_tb(s, dest)) {
         tcg_gen_goto_tb(n);
         gen_a64_set_pc_im(dest);
@@ -475,6 +556,7 @@ TCGv_i64 read_cpu_reg(DisasContext *s, int reg, int sf)
         } else {
             tcg_gen_ext32u_i64(v, cpu_X[reg]);
         }
+        gen_trace_load_reg(reg, false);
     } else {
         tcg_gen_movi_i64(v, 0);
     }
@@ -489,6 +571,7 @@ TCGv_i64 read_cpu_reg_sp(DisasContext *s, int reg, int sf)
     } else {
         tcg_gen_ext32u_i64(v, cpu_X[reg]);
     }
+    gen_trace_load_reg(reg, true);
     return v;
 }
 
@@ -685,6 +768,7 @@ static inline void gen_set_NZ64(TCGv_i64 result)
 {
     tcg_gen_extr_i64_i32(cpu_ZF, cpu_NF, result);
     tcg_gen_or_i32(cpu_ZF, cpu_ZF, cpu_NF);
+    trace_store_cpsr(TRACE_CPSR_ZF | TRACE_CPSR_NF);
 }
 
 /* Set NZCV as for a logical operation: NZ as per result, CV cleared. */
@@ -695,9 +779,11 @@ static inline void gen_logic_CC(int sf, TCGv_i64 result)
     } else {
         tcg_gen_extrl_i64_i32(cpu_ZF, result);
         tcg_gen_mov_i32(cpu_NF, cpu_ZF);
+        trace_store_cpsr(TRACE_CPSR_ZF | TRACE_CPSR_NF);
     }
     tcg_gen_movi_i32(cpu_CF, 0);
     tcg_gen_movi_i32(cpu_VF, 0);
+    trace_store_cpsr(TRACE_CPSR_CF | TRACE_CPSR_VF);
 }
 
 /* dest = T0 + T1; compute C, N, V and Z flags */
@@ -725,6 +811,7 @@ static void gen_add_CC(int sf, TCGv_i64 dest, TCGv_i64 t0, TCGv_i64 t1)
         tcg_gen_mov_i64(dest, result);
         tcg_temp_free_i64(result);
         tcg_temp_free_i64(flag);
+        trace_store_cpsr(TRACE_CPSR_CF | TRACE_CPSR_VF);
     } else {
         /* 32 bit arithmetic */
         TCGv_i32 t0_32 = tcg_temp_new_i32();
@@ -744,6 +831,7 @@ static void gen_add_CC(int sf, TCGv_i64 dest, TCGv_i64 t0, TCGv_i64 t1)
         tcg_temp_free_i32(tmp);
         tcg_temp_free_i32(t0_32);
         tcg_temp_free_i32(t1_32);
+        trace_store_cpsr(TRACE_CPSR_ZF | TRACE_CPSR_NF | TRACE_CPSR_CF | TRACE_CPSR_VF);
     }
 }
 
@@ -772,6 +860,7 @@ static void gen_sub_CC(int sf, TCGv_i64 dest, TCGv_i64 t0, TCGv_i64 t1)
         tcg_gen_mov_i64(dest, result);
         tcg_temp_free_i64(flag);
         tcg_temp_free_i64(result);
+        trace_store_cpsr(TRACE_CPSR_CF | TRACE_CPSR_VF);
     } else {
         /* 32 bit arithmetic */
         TCGv_i32 t0_32 = tcg_temp_new_i32();
@@ -791,6 +880,7 @@ static void gen_sub_CC(int sf, TCGv_i64 dest, TCGv_i64 t0, TCGv_i64 t1)
         tcg_gen_and_i32(cpu_VF, cpu_VF, tmp);
         tcg_temp_free_i32(tmp);
         tcg_gen_extu_i32_i64(dest, cpu_NF);
+        trace_store_cpsr(TRACE_CPSR_ZF | TRACE_CPSR_NF | TRACE_CPSR_CF | TRACE_CPSR_VF);
     }
 }
 
@@ -873,6 +963,11 @@ static void do_gpr_st_memidx(DisasContext *s, TCGv_i64 source,
 {
     memop = finalize_memop(s, memop);
     tcg_gen_qemu_st_i64(source, tcg_addr, memidx, memop);
+#ifdef HAS_TRACEWRAP
+    TCGv_i32 t = tcg_const_i32(memop);
+    gen_helper_trace_st64_64(cpu_env, source, tcg_addr, t);
+    tcg_temp_free_i32(t);
+#endif
 
     if (iss_valid) {
         uint32_t syn;
@@ -908,6 +1003,11 @@ static void do_gpr_ld_memidx(DisasContext *s, TCGv_i64 dest, TCGv_i64 tcg_addr,
 {
     memop = finalize_memop(s, memop);
     tcg_gen_qemu_ld_i64(dest, tcg_addr, memidx, memop);
+#ifdef HAS_TRACEWRAP
+    TCGv_i32 t = tcg_const_i32(memop);
+    gen_helper_trace_ld64_64(cpu_env, dest, tcg_addr, t);
+    tcg_temp_free_i32(t);
+#endif
 
     if (extend && (memop & MO_SIGN)) {
         g_assert((memop & MO_SIZE) <= MO_32);
@@ -1367,6 +1467,7 @@ static void disas_uncond_b_imm(DisasContext *s, uint32_t insn)
     if (insn & (1U << 31)) {
         /* BL Branch with link */
         tcg_gen_movi_i64(cpu_reg(s, 30), s->base.pc_next);
+        gen_trace_store_reg(30, false);
     }
 
     /* B Branch / BL Branch with link */
@@ -1422,6 +1523,7 @@ static void disas_test_b_imm(DisasContext *s, uint32_t insn)
     addr = s->pc_curr + sextract32(insn, 5, 14) * 4;
     rt = extract32(insn, 0, 5);
 
+    gen_trace_load_reg(rt, false);
     tcg_cmp = tcg_temp_new_i64();
     tcg_gen_andi_i64(tcg_cmp, cpu_reg(s, rt), (1ULL << bit_pos));
     label_match = gen_new_label();
@@ -1980,9 +2082,13 @@ static void handle_sys(DisasContext *s, uint32_t insn, bool isread,
     case ARM_CP_NZCV:
         tcg_rt = cpu_reg(s, rt);
         if (isread) {
+            trace_read_cpsr(TRACE_CPSR_NF | TRACE_CPSR_ZF | TRACE_CPSR_CF | TRACE_CPSR_VF);
             gen_get_nzcv(tcg_rt);
+            gen_trace_store_reg(rt, false);
         } else {
+            gen_trace_load_reg(rt, false);
             gen_set_nzcv(tcg_rt);
+            trace_store_cpsr(TRACE_CPSR_NF | TRACE_CPSR_ZF | TRACE_CPSR_CF | TRACE_CPSR_VF);
         }
         return;
     case ARM_CP_CURRENTEL:
@@ -2157,6 +2263,9 @@ static void disas_exc(DisasContext *s, uint32_t insn)
     int op2_ll = extract32(insn, 0, 5);
     int imm16 = extract32(insn, 5, 16);
 
+#ifdef HAS_TRACEWRAP
+    gen_trace_endframe(s);
+#endif
     switch (opc) {
     case 0:
         /* For SVC, HVC and SMC we advance the single-step state
@@ -2277,6 +2386,7 @@ static void disas_uncond_b_reg(DisasContext *s, uint32_t insn)
     case 1: /* BLR */
     case 2: /* RET */
         btype_mod = opc;
+        gen_trace_load_reg(rn, false);
         switch (op3) {
         case 0:
             /* BR, BLR, RET */
@@ -2324,6 +2434,7 @@ static void disas_uncond_b_reg(DisasContext *s, uint32_t insn)
         /* BLR also needs to load return address */
         if (opc == 1) {
             tcg_gen_movi_i64(cpu_reg(s, 30), s->base.pc_next);
+            gen_trace_store_reg(30, false);
         }
         break;
 
@@ -2336,6 +2447,7 @@ static void disas_uncond_b_reg(DisasContext *s, uint32_t insn)
             goto do_unallocated;
         }
         btype_mod = opc & 1;
+        gen_trace_load_reg(rn, false);
         if (s->pauth_active) {
             dst = new_tmp_a64(s);
             modifier = cpu_reg_sp(s, op4);
@@ -2351,6 +2463,7 @@ static void disas_uncond_b_reg(DisasContext *s, uint32_t insn)
         /* BLRAA also needs to load return address */
         if (opc == 9) {
             tcg_gen_movi_i64(cpu_reg(s, 30), s->base.pc_next);
+            gen_trace_store_reg(30, false);
         }
         break;
 
@@ -2615,12 +2728,19 @@ static void gen_compare_and_swap(DisasContext *s, int rs, int rt,
     int memidx = get_mem_index(s);
     TCGv_i64 clean_addr;
 
+    gen_trace_load_reg(rn, true);
     if (rn == 31) {
         gen_check_sp_alignment(s);
     }
     clean_addr = gen_mte_check1(s, cpu_reg_sp(s, rn), true, rn != 31, size);
+    MemOp mop = size | MO_ALIGN | s->be_data;
+    gen_trace_mem_access_atomic(clean_addr, memidx, mop, false);
+    gen_trace_load_reg(rs, false);
+    gen_trace_load_reg(rt, false);
     tcg_gen_atomic_cmpxchg_i64(tcg_rs, clean_addr, tcg_rs, tcg_rt, memidx,
-                               size | MO_ALIGN | s->be_data);
+                               mop);
+    gen_trace_mem_access_atomic(clean_addr, memidx, mop, true);
+    gen_trace_store_reg(rs, true);
 }
 
 static void gen_compare_and_swap_pair(DisasContext *s, int rs, int rt,
@@ -2810,12 +2930,14 @@ static void disas_ldst_excl(DisasContext *s, uint32_t insn)
         if (rn == 31) {
             gen_check_sp_alignment(s);
         }
+        gen_trace_load_reg(rn, true);
         clean_addr = gen_mte_check1(s, cpu_reg_sp(s, rn),
                                     false, rn != 31, size);
         /* TODO: ARMv8.4-LSE SCTLR.nAA */
         do_gpr_ld(s, cpu_reg(s, rt), clean_addr, size | MO_ALIGN, false, true,
                   rt, disas_ldst_compute_iss_sf(size, false, 0), is_lasr);
         tcg_gen_mb(TCG_MO_ALL | TCG_BAR_LDAQ);
+        gen_trace_store_reg(rt, false);
         return;
 
     case 0x2: case 0x3: /* CASP / STXP */
@@ -2929,6 +3051,7 @@ static void disas_ld_lit(DisasContext *s, uint32_t insn)
         do_gpr_ld(s, tcg_rt, clean_addr, size + is_signed * MO_SIGN,
                   false, true, rt, iss_sf, false);
     }
+    gen_trace_store_reg(rt, false);
 }
 
 /*
@@ -3092,7 +3215,13 @@ static void disas_ldst_pair(DisasContext *s, uint32_t insn)
 
             tcg_gen_mov_i64(tcg_rt, tmp);
             tcg_temp_free_i64(tmp);
+
+            gen_trace_store_reg(rt, false);
+            gen_trace_store_reg(rt2, false);
         } else {
+            gen_trace_load_reg(rt, false);
+            gen_trace_load_reg(rt2, false);
+
             do_gpr_st(s, tcg_rt, clean_addr, size,
                       false, 0, false, false);
             tcg_gen_addi_i64(clean_addr, clean_addr, 1 << size);
@@ -3106,6 +3235,7 @@ static void disas_ldst_pair(DisasContext *s, uint32_t insn)
             tcg_gen_addi_i64(dirty_addr, dirty_addr, offset);
         }
         tcg_gen_mov_i64(cpu_reg_sp(s, rn), dirty_addr);
+        gen_trace_store_reg(rn, true);
     }
 }
 
@@ -3218,12 +3348,14 @@ static void disas_ldst_reg_imm9(DisasContext *s, uint32_t insn,
         bool iss_sf = disas_ldst_compute_iss_sf(size, is_signed, opc);
 
         if (is_store) {
+            gen_trace_load_reg(rt, false);
             do_gpr_st_memidx(s, tcg_rt, clean_addr, size, memidx,
                              iss_valid, rt, iss_sf, false);
         } else {
             do_gpr_ld_memidx(s, tcg_rt, clean_addr, size + is_signed * MO_SIGN,
                              is_extended, memidx,
                              iss_valid, rt, iss_sf, false);
+            gen_trace_store_reg(rt, false);
         }
     }
 
@@ -3233,6 +3365,7 @@ static void disas_ldst_reg_imm9(DisasContext *s, uint32_t insn,
             tcg_gen_addi_i64(dirty_addr, dirty_addr, imm9);
         }
         tcg_gen_mov_i64(tcg_rn, dirty_addr);
+        gen_trace_store_reg(rn, true);
     }
 }
 
@@ -3323,11 +3456,13 @@ static void disas_ldst_reg_roffset(DisasContext *s, uint32_t insn,
         TCGv_i64 tcg_rt = cpu_reg(s, rt);
         bool iss_sf = disas_ldst_compute_iss_sf(size, is_signed, opc);
         if (is_store) {
+            gen_trace_load_reg(rt, false);
             do_gpr_st(s, tcg_rt, clean_addr, size,
                       true, rt, iss_sf, false);
         } else {
             do_gpr_ld(s, tcg_rt, clean_addr, size + is_signed * MO_SIGN,
                       is_extended, true, rt, iss_sf, false);
+            gen_trace_store_reg(rt, false);
         }
     }
 }
@@ -3407,11 +3542,13 @@ static void disas_ldst_reg_unsigned_imm(DisasContext *s, uint32_t insn,
         TCGv_i64 tcg_rt = cpu_reg(s, rt);
         bool iss_sf = disas_ldst_compute_iss_sf(size, is_signed, opc);
         if (is_store) {
+            gen_trace_load_reg(rt, false);
             do_gpr_st(s, tcg_rt, clean_addr, size,
                       true, rt, iss_sf, false);
         } else {
             do_gpr_ld(s, tcg_rt, clean_addr, size + is_signed * MO_SIGN,
                       is_extended, true, rt, iss_sf, false);
+            gen_trace_store_reg(rt, false);
         }
     }
 }
@@ -3491,6 +3628,7 @@ static void disas_ldst_atomic(DisasContext *s, uint32_t insn,
     if (rn == 31) {
         gen_check_sp_alignment(s);
     }
+    gen_trace_load_reg(rn, true);
     clean_addr = gen_mte_check1(s, cpu_reg_sp(s, rn), false, rn != 31, size);
 
     if (o3_opc == 014) {
@@ -3504,6 +3642,7 @@ static void disas_ldst_atomic(DisasContext *s, uint32_t insn,
         do_gpr_ld(s, cpu_reg(s, rt), clean_addr, size, false,
                   true, rt, disas_ldst_compute_iss_sf(size, false, 0), true);
         tcg_gen_mb(TCG_MO_ALL | TCG_BAR_LDAQ);
+        gen_trace_store_reg(rt, false);
         return;
     }
 
@@ -3517,11 +3656,14 @@ static void disas_ldst_atomic(DisasContext *s, uint32_t insn,
     /* The tcg atomic primitives are all full barriers.  Therefore we
      * can ignore the Acquire and Release bits of this instruction.
      */
+    gen_trace_mem_access_atomic(clean_addr, get_mem_index(s), mop, false);
     fn(tcg_rt, clean_addr, tcg_rs, get_mem_index(s), mop);
+    gen_trace_mem_access_atomic(clean_addr, get_mem_index(s), mop, true);
 
     if ((mop & MO_SIGN) && size != MO_64) {
         tcg_gen_ext32u_i64(tcg_rt, tcg_rt);
     }
+    gen_trace_store_reg(rt, false);
 }
 
 /*
@@ -4280,6 +4422,7 @@ static void disas_pc_rel_adr(DisasContext *s, uint32_t insn)
     }
 
     tcg_gen_movi_i64(cpu_reg(s, rd), base + offset);
+    gen_trace_store_reg(rd, false);
 }
 
 /*
@@ -4306,6 +4449,7 @@ static void disas_add_sub_imm(DisasContext *s, uint32_t insn)
     bool is_64bit = extract32(insn, 31, 1);
 
     TCGv_i64 tcg_rn = cpu_reg_sp(s, rn);
+    gen_trace_load_reg(rn, true);
     TCGv_i64 tcg_rd = setflags ? cpu_reg(s, rd) : cpu_reg_sp(s, rd);
     TCGv_i64 tcg_result;
 
@@ -4334,6 +4478,8 @@ static void disas_add_sub_imm(DisasContext *s, uint32_t insn)
     } else {
         tcg_gen_ext32u_i64(tcg_rd, tcg_result);
     }
+
+    gen_trace_store_reg(rd, !setflags);
 
     tcg_temp_free_i64(tcg_result);
 }
@@ -4502,6 +4648,7 @@ static void disas_logic_imm(DisasContext *s, uint32_t insn)
         tcg_rd = cpu_reg_sp(s, rd);
     }
     tcg_rn = cpu_reg(s, rn);
+    gen_trace_load_reg(rn, false);
 
     if (!logic_imm_decode_wmask(&wmask, is_n, imms, immr)) {
         /* some immediate field values are reserved */
@@ -4536,6 +4683,8 @@ static void disas_logic_imm(DisasContext *s, uint32_t insn)
          */
         tcg_gen_ext32u_i64(tcg_rd, tcg_rd);
     }
+
+    gen_trace_store_reg(rd, opc != 0x3);
 
     if (opc == 3) { /* ANDS */
         gen_logic_CC(sf, tcg_rd);
@@ -4588,8 +4737,9 @@ static void disas_movw_imm(DisasContext *s, uint32_t insn)
         break;
     default:
         unallocated_encoding(s);
-        break;
+        return;
     }
+    gen_trace_store_reg(rd, false);
 }
 
 /* Bitfield
@@ -4633,6 +4783,7 @@ static void disas_bitfield(DisasContext *s, uint32_t insn)
             goto done;
         } else if (opc == 2) { /* UBFM: UBFX, LSR, UXTB, UXTH */
             tcg_gen_extract_i64(tcg_rd, tcg_tmp, ri, len);
+            gen_trace_store_reg(rd, false);
             return;
         }
         /* opc == 1, BFXIL fall through to deposit */
@@ -4654,6 +4805,7 @@ static void disas_bitfield(DisasContext *s, uint32_t insn)
         len = ri;
     }
 
+    gen_trace_load_reg(rd, false);
     if (opc == 1) { /* BFM, BFXIL */
         tcg_gen_deposit_i64(tcg_rd, tcg_rd, tcg_tmp, pos, len);
     } else {
@@ -4661,6 +4813,7 @@ static void disas_bitfield(DisasContext *s, uint32_t insn)
            any bits outside bitsize, therefore the zero-extension
            below is unneeded.  */
         tcg_gen_deposit_z_i64(tcg_rd, tcg_tmp, pos, len);
+        gen_trace_store_reg(rd, false);
         return;
     }
 
@@ -4668,6 +4821,7 @@ static void disas_bitfield(DisasContext *s, uint32_t insn)
     if (!sf) { /* zero extend final result */
         tcg_gen_ext32u_i64(tcg_rd, tcg_rd);
     }
+    gen_trace_store_reg(rd, false);
 }
 
 /* Extract
@@ -4701,6 +4855,7 @@ static void disas_extract(DisasContext *s, uint32_t insn)
             /* tcg shl_i32/shl_i64 is undefined for 32/64 bit shifts,
              * so an extract from bit 0 is a special case.
              */
+            gen_trace_load_reg(rm, false);
             if (sf) {
                 tcg_gen_mov_i64(tcg_rd, cpu_reg(s, rm));
             } else {
@@ -4709,6 +4864,11 @@ static void disas_extract(DisasContext *s, uint32_t insn)
         } else {
             tcg_rm = cpu_reg(s, rm);
             tcg_rn = cpu_reg(s, rn);
+
+            gen_trace_load_reg(rm, false);
+            if (rn != rm) {
+                gen_trace_load_reg(rn, false);
+            }
 
             if (sf) {
                 /* Specialization to ROR happens in EXTRACT2.  */
@@ -4729,6 +4889,7 @@ static void disas_extract(DisasContext *s, uint32_t insn)
                 tcg_temp_free_i32(t0);
             }
         }
+        gen_trace_store_reg(rd, false);
     }
 }
 
@@ -4845,6 +5006,8 @@ static void disas_logic_reg(DisasContext *s, uint32_t insn)
     rn = extract32(insn, 5, 5);
     rd = extract32(insn, 0, 5);
 
+    gen_trace_load_reg(rn, false);
+
     if (!sf && (shift_amount & (1 << 5))) {
         unallocated_encoding(s);
         return;
@@ -4857,6 +5020,7 @@ static void disas_logic_reg(DisasContext *s, uint32_t insn)
          * register-register MOV and MVN, so it is worth special casing.
          */
         tcg_rm = cpu_reg(s, rm);
+        gen_trace_load_reg(rm, false);
         if (invert) {
             tcg_gen_not_i64(tcg_rd, tcg_rm);
             if (!sf) {
@@ -4869,6 +5033,7 @@ static void disas_logic_reg(DisasContext *s, uint32_t insn)
                 tcg_gen_ext32u_i64(tcg_rd, tcg_rm);
             }
         }
+        gen_trace_store_reg(rd, false);
         return;
     }
 
@@ -4909,6 +5074,8 @@ static void disas_logic_reg(DisasContext *s, uint32_t insn)
     if (!sf) {
         tcg_gen_ext32u_i64(tcg_rd, tcg_rd);
     }
+
+    gen_trace_store_reg(rd, false);
 
     if (opc == 3) {
         gen_logic_CC(sf, tcg_rd);
@@ -4987,6 +5154,8 @@ static void disas_add_sub_ext_reg(DisasContext *s, uint32_t insn)
     }
 
     tcg_temp_free_i64(tcg_result);
+
+    gen_trace_store_reg(rd, !setflags);
 }
 
 /*
@@ -5051,6 +5220,8 @@ static void disas_add_sub_reg(DisasContext *s, uint32_t insn)
     }
 
     tcg_temp_free_i64(tcg_result);
+
+    gen_trace_store_reg(rd, false);
 }
 
 /* Data-processing (3 source)
@@ -5103,11 +5274,14 @@ static void disas_data_proc_3src(DisasContext *s, uint32_t insn)
         TCGv_i64 tcg_rn = cpu_reg(s, rn);
         TCGv_i64 tcg_rm = cpu_reg(s, rm);
 
+        gen_trace_load_reg(rn, false);
+        gen_trace_load_reg(rm, false);
         if (is_signed) {
             tcg_gen_muls2_i64(low_bits, tcg_rd, tcg_rn, tcg_rm);
         } else {
             tcg_gen_mulu2_i64(low_bits, tcg_rd, tcg_rn, tcg_rm);
         }
+        gen_trace_store_reg(rd, false);
 
         tcg_temp_free_i64(low_bits);
         return;
@@ -5117,6 +5291,8 @@ static void disas_data_proc_3src(DisasContext *s, uint32_t insn)
     tcg_op2 = tcg_temp_new_i64();
     tcg_tmp = tcg_temp_new_i64();
 
+    gen_trace_load_reg(rn, false);
+    gen_trace_load_reg(rm, false);
     if (op_id < 0x42) {
         tcg_gen_mov_i64(tcg_op1, cpu_reg(s, rn));
         tcg_gen_mov_i64(tcg_op2, cpu_reg(s, rm));
@@ -5135,6 +5311,7 @@ static void disas_data_proc_3src(DisasContext *s, uint32_t insn)
         tcg_gen_mul_i64(cpu_reg(s, rd), tcg_op1, tcg_op2);
     } else {
         tcg_gen_mul_i64(tcg_tmp, tcg_op1, tcg_op2);
+        gen_trace_load_reg(ra, false);
         if (is_sub) {
             tcg_gen_sub_i64(cpu_reg(s, rd), cpu_reg(s, ra), tcg_tmp);
         } else {
@@ -5149,6 +5326,8 @@ static void disas_data_proc_3src(DisasContext *s, uint32_t insn)
     tcg_temp_free_i64(tcg_op1);
     tcg_temp_free_i64(tcg_op2);
     tcg_temp_free_i64(tcg_tmp);
+
+    gen_trace_store_reg(rd, false);
 }
 
 /* Add/subtract (with carry)
@@ -5307,8 +5486,10 @@ static void disas_cc(DisasContext *s, uint32_t insn)
         tcg_gen_movi_i64(tcg_y, y);
     } else {
         tcg_y = cpu_reg(s, y);
+        gen_trace_load_reg(y, false);
     }
     tcg_rn = cpu_reg(s, rn);
+    gen_trace_load_reg(rn, false);
 
     /* Set the flags for the new comparison.  */
     tcg_tmp = tcg_temp_new_i64();
@@ -5416,6 +5597,7 @@ static void disas_cond_select(DisasContext *s, uint32_t insn)
         } else if (else_inc) {
             tcg_gen_addi_i64(t_false, t_false, 1);
         }
+        gen_trace_load_reg(rn, false);
         tcg_gen_movcond_i64(c.cond, tcg_rd, c.value, zero, t_true, t_false);
     }
 
@@ -5424,6 +5606,7 @@ static void disas_cond_select(DisasContext *s, uint32_t insn)
     if (!sf) {
         tcg_gen_ext32u_i64(tcg_rd, tcg_rd);
     }
+    gen_trace_store_reg(rd, false);
 }
 
 static void handle_clz(DisasContext *s, unsigned int sf,
@@ -5433,6 +5616,7 @@ static void handle_clz(DisasContext *s, unsigned int sf,
     tcg_rd = cpu_reg(s, rd);
     tcg_rn = cpu_reg(s, rn);
 
+    gen_trace_load_reg(rn, false);
     if (sf) {
         tcg_gen_clzi_i64(tcg_rd, tcg_rn, 64);
     } else {
@@ -5442,6 +5626,7 @@ static void handle_clz(DisasContext *s, unsigned int sf,
         tcg_gen_extu_i32_i64(tcg_rd, tcg_tmp32);
         tcg_temp_free_i32(tcg_tmp32);
     }
+    gen_trace_store_reg(rd, false);
 }
 
 static void handle_cls(DisasContext *s, unsigned int sf,
@@ -5451,6 +5636,7 @@ static void handle_cls(DisasContext *s, unsigned int sf,
     tcg_rd = cpu_reg(s, rd);
     tcg_rn = cpu_reg(s, rn);
 
+    gen_trace_load_reg(rn, false);
     if (sf) {
         tcg_gen_clrsb_i64(tcg_rd, tcg_rn);
     } else {
@@ -5460,6 +5646,7 @@ static void handle_cls(DisasContext *s, unsigned int sf,
         tcg_gen_extu_i32_i64(tcg_rd, tcg_tmp32);
         tcg_temp_free_i32(tcg_tmp32);
     }
+    gen_trace_store_reg(rd, false);
 }
 
 static void handle_rbit(DisasContext *s, unsigned int sf,
@@ -5469,6 +5656,7 @@ static void handle_rbit(DisasContext *s, unsigned int sf,
     tcg_rd = cpu_reg(s, rd);
     tcg_rn = cpu_reg(s, rn);
 
+    gen_trace_load_reg(rn, false);
     if (sf) {
         gen_helper_rbit64(tcg_rd, tcg_rn);
     } else {
@@ -5478,6 +5666,7 @@ static void handle_rbit(DisasContext *s, unsigned int sf,
         tcg_gen_extu_i32_i64(tcg_rd, tcg_tmp32);
         tcg_temp_free_i32(tcg_tmp32);
     }
+    gen_trace_store_reg(rd, false);
 }
 
 /* REV with sf==1, opcode==3 ("REV64") */
@@ -5488,7 +5677,9 @@ static void handle_rev64(DisasContext *s, unsigned int sf,
         unallocated_encoding(s);
         return;
     }
+    gen_trace_load_reg(rn, false);
     tcg_gen_bswap64_i64(cpu_reg(s, rd), cpu_reg(s, rn));
+    gen_trace_store_reg(rd, false);
 }
 
 /* REV with sf==0, opcode==2
@@ -5500,12 +5691,14 @@ static void handle_rev32(DisasContext *s, unsigned int sf,
     TCGv_i64 tcg_rd = cpu_reg(s, rd);
     TCGv_i64 tcg_rn = cpu_reg(s, rn);
 
+    gen_trace_load_reg(rn, false);
     if (sf) {
         tcg_gen_bswap64_i64(tcg_rd, tcg_rn);
         tcg_gen_rotri_i64(tcg_rd, tcg_rd, 32);
     } else {
         tcg_gen_bswap32_i64(tcg_rd, tcg_rn, TCG_BSWAP_OZ);
     }
+    gen_trace_store_reg(rd, false);
 }
 
 /* REV16 (opcode==1) */
@@ -5524,6 +5717,7 @@ static void handle_rev16(DisasContext *s, unsigned int sf,
     tcg_gen_or_i64(tcg_rd, tcg_rd, tcg_tmp);
 
     tcg_temp_free_i64(tcg_tmp);
+    gen_trace_store_reg(rd, false);
 }
 
 /* Data-processing (1 source)
@@ -5734,6 +5928,8 @@ static void handle_div(DisasContext *s, bool is_signed, unsigned int sf,
     tcg_rd = cpu_reg(s, rd);
 
     if (!sf && is_signed) {
+        gen_trace_load_reg(rn, false);
+        gen_trace_load_reg(rm, false);
         tcg_n = new_tmp_a64(s);
         tcg_m = new_tmp_a64(s);
         tcg_gen_ext32s_i64(tcg_n, cpu_reg(s, rn));
@@ -5752,6 +5948,7 @@ static void handle_div(DisasContext *s, bool is_signed, unsigned int sf,
     if (!sf) { /* zero extend final result */
         tcg_gen_ext32u_i64(tcg_rd, tcg_rd);
     }
+    gen_trace_store_reg(rd, false);
 }
 
 /* LSLV, LSRV, ASRV, RORV */
@@ -5763,9 +5960,11 @@ static void handle_shift_reg(DisasContext *s,
     TCGv_i64 tcg_rd = cpu_reg(s, rd);
     TCGv_i64 tcg_rn = read_cpu_reg(s, rn, sf);
 
+    gen_trace_load_reg(rm, false);
     tcg_gen_andi_i64(tcg_shift, cpu_reg(s, rm), sf ? 63 : 31);
     shift_reg(tcg_rd, tcg_rn, sf, shift_type, tcg_shift);
     tcg_temp_free_i64(tcg_shift);
+    gen_trace_store_reg(rd, false);
 }
 
 /* CRC32[BHWX], CRC32C[BHWX] */
@@ -14886,6 +15085,9 @@ static void aarch64_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     if (s->sme_trap_nonstreaming) {
         disas_sme_fa64(s, insn);
     }
+#ifdef HAS_TRACEWRAP
+    gen_trace_newframe(s);
+#endif
 
     switch (extract32(insn, 25, 4)) {
     case 0x0:
@@ -14936,6 +15138,10 @@ static void aarch64_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     if (s->btype > 0 && s->base.is_jmp != DISAS_NORETURN) {
         reset_btype(s);
     }
+
+#ifdef HAS_TRACEWRAP
+    gen_trace_endframe(s);
+#endif
 
     translator_loop_temp_check(&s->base);
 }
