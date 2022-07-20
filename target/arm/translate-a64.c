@@ -636,6 +636,37 @@ static TCGv_i32 read_fp_hreg(DisasContext *s, int reg)
     return v;
 }
 
+
+
+#ifdef HAS_TRACEWRAP
+/**
+ * Insert a trace store event for 128 bit fp/simd register. 
+ */
+static void gen_trace_reg128_var(DisasContext *s, int reg, bool store) {
+    TCGv_i64 hi = tcg_temp_new_i64();
+    TCGv_i64 lo = tcg_temp_new_i64();
+
+    tcg_gen_ld_i64(lo, cpu_env, vec_reg_offset(s, reg, 0, MO_64));
+    tcg_gen_ld_i64(hi, cpu_env, vec_reg_offset(s, reg, 1, MO_64));
+
+    TCGv_i32 t = tcg_const_i32(reg);
+
+    if (store) {
+        gen_helper_trace_store_reg128(t, hi, lo);
+    } else {
+        gen_helper_trace_load_reg128(t, hi, lo);
+    }
+
+    tcg_temp_free_i32(t);
+    tcg_temp_free_i64(hi);
+    tcg_temp_free_i64(lo);
+}
+
+
+#else
+static void gen_trace_reg128_var(DisasContext *s, int reg, bool store);
+#endif 
+
 /* Clear the bits above an N-bit vector, for N = (is_q ? 128 : 64).
  * If SVE is not enabled, then there are only 128 bits in the vector.
  */
@@ -8015,6 +8046,7 @@ static void disas_simd_across_lanes(DisasContext *s, uint32_t insn)
      * we use 64 bits always. The floating point
      * ops do require 32 bit intermediates, though.
      */
+    gen_trace_reg128_var(s, rn, false);
     if (!is_fp) {
         read_vec_element(s, tcg_res, rn, 0, size | (is_u ? 0 : MO_SIGN));
 
@@ -8087,6 +8119,7 @@ static void disas_simd_across_lanes(DisasContext *s, uint32_t insn)
 
     write_fp_dreg(s, rd, tcg_res);
     tcg_temp_free_i64(tcg_res);
+
 }
 
 /* DUP (Element, Vector)
@@ -8317,6 +8350,8 @@ static void disas_simd_copy(DisasContext *s, uint32_t insn)
     int is_q = extract32(insn, 30, 1);
     int imm5 = extract32(insn, 16, 5);
 
+    gen_trace_reg128_var(s, rn, false);
+    gen_trace_reg128_var(s, rd, false);
     if (op) {
         if (is_q) {
             /* INS (element) */
@@ -8352,6 +8387,7 @@ static void disas_simd_copy(DisasContext *s, uint32_t insn)
             break;
         }
     }
+    gen_trace_reg128_var(s, rd, true);
 }
 
 /* AdvSIMD modified immediate
@@ -8404,6 +8440,7 @@ static void disas_simd_mod_imm(DisasContext *s, uint32_t insn)
         tcg_gen_gvec_dup_imm(MO_64, vec_full_reg_offset(s, rd), is_q ? 16 : 8,
                              vec_full_reg_size(s), imm);
     } else {
+        gen_trace_reg128_var(s, rd, false);
         /* ORR or BIC, with BIC negation to AND handled above.  */
         if (is_neg) {
             gen_gvec_fn2i(s, is_q, rd, rd, imm, tcg_gen_gvec_andi, MO_64);
@@ -8411,6 +8448,9 @@ static void disas_simd_mod_imm(DisasContext *s, uint32_t insn)
             gen_gvec_fn2i(s, is_q, rd, rd, imm, tcg_gen_gvec_ori, MO_64);
         }
     }
+
+    gen_trace_reg128_var(s, rd, true);
+    
 }
 
 /* AdvSIMD scalar copy
@@ -8433,7 +8473,10 @@ static void disas_simd_scalar_copy(DisasContext *s, uint32_t insn)
     }
 
     /* DUP (element, scalar) */
+
+    gen_trace_reg128_var(s, rn, false);
     handle_simd_dupes(s, rd, rn, imm5);
+    gen_trace_reg128_var(s, rd, true);
 }
 
 /* AdvSIMD scalar pairwise
@@ -8457,6 +8500,7 @@ static void disas_simd_scalar_pairwise(DisasContext *s, uint32_t insn)
      */
     opcode |= (extract32(size, 1, 1) << 5);
 
+    gen_trace_reg128_var(s, rn, false);
     switch (opcode) {
     case 0x3b: /* ADDP */
         if (u || size != 3) {
@@ -8589,6 +8633,8 @@ static void disas_simd_scalar_pairwise(DisasContext *s, uint32_t insn)
         tcg_temp_free_i32(tcg_op2);
         tcg_temp_free_i32(tcg_res);
     }
+
+    gen_trace_reg128_var(s, rd, true);
 
     if (fpst) {
         tcg_temp_free_ptr(fpst);
@@ -9273,6 +9319,8 @@ static void disas_simd_scalar_shift_imm(DisasContext *s, uint32_t insn)
         return;
     }
 
+    gen_trace_reg128_var(s, rn, false);
+    gen_trace_reg128_var(s, rd, false);
     switch (opcode) {
     case 0x08: /* SRI */
         if (!is_u) {
@@ -9324,6 +9372,8 @@ static void disas_simd_scalar_shift_imm(DisasContext *s, uint32_t insn)
         unallocated_encoding(s);
         break;
     }
+
+    gen_trace_reg128_var(s, rd, true);
 }
 
 /* AdvSIMD scalar three different
@@ -9346,6 +9396,9 @@ static void disas_simd_scalar_three_reg_diff(DisasContext *s, uint32_t insn)
         return;
     }
 
+    gen_trace_reg128_var(s, rn, false);
+    gen_trace_reg128_var(s, rm, false);
+    gen_trace_reg128_var(s, rd, false);
     switch (opcode) {
     case 0x9: /* SQDMLAL, SQDMLAL2 */
     case 0xb: /* SQDMLSL, SQDMLSL2 */
@@ -9429,6 +9482,8 @@ static void disas_simd_scalar_three_reg_diff(DisasContext *s, uint32_t insn)
         tcg_temp_free_i32(tcg_op2);
         tcg_temp_free_i64(tcg_res);
     }
+
+    gen_trace_reg128_var(s, rd, true);
 }
 
 static void handle_3same_64(DisasContext *s, int opcode, bool u,
@@ -9719,6 +9774,9 @@ static void disas_simd_scalar_three_reg_same(DisasContext *s, uint32_t insn)
     bool u = extract32(insn, 29, 1);
     TCGv_i64 tcg_rd;
 
+    gen_trace_reg128_var(s, rd, false);
+    gen_trace_reg128_var(s, rn, false);
+    gen_trace_reg128_var(s, rm, false);
     if (opcode >= 0x18) {
         /* Floating point: U, size[1] and opcode indicate operation */
         int fpopcode = opcode | (extract32(size, 1, 1) << 5) | (u << 6);
@@ -9865,6 +9923,7 @@ static void disas_simd_scalar_three_reg_same(DisasContext *s, uint32_t insn)
     }
 
     write_fp_dreg(s, rd, tcg_rd);
+    gen_trace_reg128_var(s, rd, true);
 
     tcg_temp_free_i64(tcg_rd);
 }
@@ -9916,6 +9975,9 @@ static void disas_simd_scalar_three_reg_same_fp16(DisasContext *s,
         return;
     }
 
+    gen_trace_reg128_var(s, rn, false);
+    gen_trace_reg128_var(s, rm, false);
+    gen_trace_reg128_var(s, rd, false);
     fpst = fpstatus_ptr(FPST_FPCR_F16);
 
     tcg_op1 = read_fp_hreg(s, rn);
@@ -9956,7 +10018,7 @@ static void disas_simd_scalar_three_reg_same_fp16(DisasContext *s,
     }
 
     write_fp_sreg(s, rd, tcg_res);
-
+    gen_trace_reg128_var(s, rd, true);
 
     tcg_temp_free_i32(tcg_res);
     tcg_temp_free_i32(tcg_op1);
@@ -9983,6 +10045,9 @@ static void disas_simd_scalar_three_reg_same_extra(DisasContext *s,
     TCGv_i64 res;
     bool feature;
 
+    gen_trace_reg128_var(s, rn, false);
+    gen_trace_reg128_var(s, rm, false);
+    gen_trace_reg128_var(s, rd, false);
     switch (u * 16 + opcode) {
     case 0x10: /* SQRDMLAH (vector) */
     case 0x11: /* SQRDMLSH (vector) */
@@ -10045,6 +10110,7 @@ static void disas_simd_scalar_three_reg_same_extra(DisasContext *s,
 
     write_fp_dreg(s, rd, res);
     tcg_temp_free_i64(res);
+    gen_trace_reg128_var(s, rd, true);
 }
 
 static void handle_2misc_64(DisasContext *s, int opcode, bool u,
@@ -10593,6 +10659,8 @@ static void disas_simd_scalar_two_reg_misc(DisasContext *s, uint32_t insn)
     TCGv_i32 tcg_rmode;
     TCGv_ptr tcg_fpstatus;
 
+    gen_trace_reg128_var(s, rn, false);
+    gen_trace_reg128_var(s, rd, false);
     switch (opcode) {
     case 0x3: /* USQADD / SUQADD*/
         if (!fp_access_check(s)) {
@@ -10779,6 +10847,7 @@ static void disas_simd_scalar_two_reg_misc(DisasContext *s, uint32_t insn)
         tcg_temp_free_i32(tcg_rmode);
         tcg_temp_free_ptr(tcg_fpstatus);
     }
+    gen_trace_reg128_var(s, rd, true);
 }
 
 /* SSHR[RA]/USHR[RA] - Vector shift right (optional rounding/accumulate) */
@@ -10985,6 +11054,8 @@ static void disas_simd_shift_imm(DisasContext *s, uint32_t insn)
     /* data_proc_simd[] has sent immh == 0 to disas_simd_mod_imm. */
     assert(immh != 0);
 
+    gen_trace_reg128_var(s, rn, false);
+    gen_trace_reg128_var(s, rd, false);
     switch (opcode) {
     case 0x08: /* SRI */
         if (!is_u) {
@@ -11039,6 +11110,7 @@ static void disas_simd_shift_imm(DisasContext *s, uint32_t insn)
         unallocated_encoding(s);
         return;
     }
+    gen_trace_reg128_var(s, rd, true);
 }
 
 /* Generate code to do a "long" addition or subtraction, ie one done in
@@ -11384,6 +11456,9 @@ static void disas_simd_three_reg_diff(DisasContext *s, uint32_t insn)
     int rn = extract32(insn, 5, 5);
     int rd = extract32(insn, 0, 5);
 
+    gen_trace_reg128_var(s, rn, false);
+    gen_trace_reg128_var(s, rm, false);
+    gen_trace_reg128_var(s, rd, false);
     switch (opcode) {
     case 1: /* SADDW, SADDW2, UADDW, UADDW2 */
     case 3: /* SSUBW, SSUBW2, USUBW, USUBW2 */
@@ -11473,6 +11548,7 @@ static void disas_simd_three_reg_diff(DisasContext *s, uint32_t insn)
         unallocated_encoding(s);
         break;
     }
+    gen_trace_reg128_var(s, rd, true);
 }
 
 /* Logic op (opcode == 3) subgroup of C3.6.16. */
@@ -11489,36 +11565,41 @@ static void disas_simd_3same_logic(DisasContext *s, uint32_t insn)
         return;
     }
 
+    gen_trace_reg128_var(s, rn, false);
+    gen_trace_reg128_var(s, rm, false);
+    gen_trace_reg128_var(s, rd, false);
     switch (size + 4 * is_u) {
     case 0: /* AND */
         gen_gvec_fn3(s, is_q, rd, rn, rm, tcg_gen_gvec_and, 0);
-        return;
+        break;
     case 1: /* BIC */
         gen_gvec_fn3(s, is_q, rd, rn, rm, tcg_gen_gvec_andc, 0);
-        return;
+        break;
     case 2: /* ORR */
         gen_gvec_fn3(s, is_q, rd, rn, rm, tcg_gen_gvec_or, 0);
-        return;
+        break;
     case 3: /* ORN */
         gen_gvec_fn3(s, is_q, rd, rn, rm, tcg_gen_gvec_orc, 0);
-        return;
+        break;
     case 4: /* EOR */
         gen_gvec_fn3(s, is_q, rd, rn, rm, tcg_gen_gvec_xor, 0);
-        return;
+        break;
 
     case 5: /* BSL bitwise select */
         gen_gvec_fn4(s, is_q, rd, rd, rn, rm, tcg_gen_gvec_bitsel, 0);
-        return;
+        break;
     case 6: /* BIT, bitwise insert if true */
         gen_gvec_fn4(s, is_q, rd, rm, rn, rd, tcg_gen_gvec_bitsel, 0);
-        return;
+        break;
     case 7: /* BIF, bitwise insert if false */
         gen_gvec_fn4(s, is_q, rd, rm, rd, rn, tcg_gen_gvec_bitsel, 0);
-        return;
+        break;
 
     default:
         g_assert_not_reached();
     }
+
+    gen_trace_reg128_var(s, rd, true);
 }
 
 /* Pairwise op subgroup of C3.6.16.
@@ -11701,6 +11782,10 @@ static void disas_simd_3same_float(DisasContext *s, uint32_t insn)
         return;
     }
 
+    gen_trace_reg128_var(s, rn, false);
+    gen_trace_reg128_var(s, rm, false);
+    gen_trace_reg128_var(s, rd, false);
+
     switch (fpopcode) {
     case 0x58: /* FMAXNMP */
     case 0x5a: /* FADDP */
@@ -11713,7 +11798,7 @@ static void disas_simd_3same_float(DisasContext *s, uint32_t insn)
         }
         handle_simd_3same_pair(s, is_q, 0, fpopcode, size ? MO_64 : MO_32,
                                rn, rm, rd);
-        return;
+        break;
     case 0x1b: /* FMULX */
     case 0x1f: /* FRECPS */
     case 0x3f: /* FRSQRTS */
@@ -11737,7 +11822,7 @@ static void disas_simd_3same_float(DisasContext *s, uint32_t insn)
             return;
         }
         handle_3same_float(s, size, elements, fpopcode, rd, rn, rm);
-        return;
+        break;
 
     case 0x1d: /* FMLAL  */
     case 0x3d: /* FMLSL  */
@@ -11757,12 +11842,13 @@ static void disas_simd_3same_float(DisasContext *s, uint32_t insn)
                                is_q ? 16 : 8, vec_full_reg_size(s),
                                data, gen_helper_gvec_fmlal_a64);
         }
-        return;
+        break;
 
     default:
         unallocated_encoding(s);
         return;
     }
+    gen_trace_reg128_var(s, rd, true);
 }
 
 /* Integer op subgroup of C3.6.16. */
@@ -11778,6 +11864,9 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
     int pass;
     TCGCond cond;
 
+    gen_trace_reg128_var(s, rn, false);
+    gen_trace_reg128_var(s, rm, false);
+    gen_trace_reg128_var(s, rd, false);
     switch (opcode) {
     case 0x13: /* MUL, PMUL */
         if (u && size != 0) {
@@ -11823,6 +11912,7 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
         } else {
             gen_gvec_fn3(s, is_q, rd, rn, rm, gen_gvec_sqadd_qc, size);
         }
+        gen_trace_reg128_var(s, rd, true);
         return;
     case 0x05: /* SQSUB, UQSUB */
         if (u) {
@@ -11830,6 +11920,7 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
         } else {
             gen_gvec_fn3(s, is_q, rd, rn, rm, gen_gvec_sqsub_qc, size);
         }
+        gen_trace_reg128_var(s, rd, true);
         return;
     case 0x08: /* SSHL, USHL */
         if (u) {
@@ -11837,6 +11928,7 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
         } else {
             gen_gvec_fn3(s, is_q, rd, rn, rm, gen_gvec_sshl, size);
         }
+        gen_trace_reg128_var(s, rd, true);
         return;
     case 0x0c: /* SMAX, UMAX */
         if (u) {
@@ -11844,6 +11936,7 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
         } else {
             gen_gvec_fn3(s, is_q, rd, rn, rm, tcg_gen_gvec_smax, size);
         }
+        gen_trace_reg128_var(s, rd, true);
         return;
     case 0x0d: /* SMIN, UMIN */
         if (u) {
@@ -11851,6 +11944,7 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
         } else {
             gen_gvec_fn3(s, is_q, rd, rn, rm, tcg_gen_gvec_smin, size);
         }
+        gen_trace_reg128_var(s, rd, true);
         return;
     case 0xe: /* SABD, UABD */
         if (u) {
@@ -11858,6 +11952,7 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
         } else {
             gen_gvec_fn3(s, is_q, rd, rn, rm, gen_gvec_sabd, size);
         }
+        gen_trace_reg128_var(s, rd, true);
         return;
     case 0xf: /* SABA, UABA */
         if (u) {
@@ -11865,6 +11960,7 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
         } else {
             gen_gvec_fn3(s, is_q, rd, rn, rm, gen_gvec_saba, size);
         }
+        gen_trace_reg128_var(s, rd, true);
         return;
     case 0x10: /* ADD, SUB */
         if (u) {
@@ -11872,6 +11968,7 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
         } else {
             gen_gvec_fn3(s, is_q, rd, rn, rm, tcg_gen_gvec_add, size);
         }
+        gen_trace_reg128_var(s, rd, true);
         return;
     case 0x13: /* MUL, PMUL */
         if (!u) { /* MUL */
@@ -11879,6 +11976,7 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
         } else {  /* PMUL */
             gen_gvec_op3_ool(s, is_q, rd, rn, rm, 0, gen_helper_gvec_pmul_b);
         }
+        gen_trace_reg128_var(s, rd, true);
         return;
     case 0x12: /* MLA, MLS */
         if (u) {
@@ -11886,6 +11984,7 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
         } else {
             gen_gvec_fn3(s, is_q, rd, rn, rm, gen_gvec_mla, size);
         }
+        gen_trace_reg128_var(s, rd, true);
         return;
     case 0x16: /* SQDMULH, SQRDMULH */
         {
@@ -11895,10 +11994,12 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
             };
             gen_gvec_op3_qc(s, is_q, rd, rn, rm, fns[size - 1][u]);
         }
+        gen_trace_reg128_var(s, rd, true);
         return;
     case 0x11:
         if (!u) { /* CMTST */
             gen_gvec_fn3(s, is_q, rd, rn, rm, gen_gvec_cmtst, size);
+            gen_trace_reg128_var(s, rd, true);
             return;
         }
         /* else CMEQ */
@@ -11914,6 +12015,7 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
                          vec_full_reg_offset(s, rn),
                          vec_full_reg_offset(s, rm),
                          is_q ? 16 : 8, vec_full_reg_size(s));
+        gen_trace_reg128_var(s, rd, true);
         return;
     }
 
@@ -12025,6 +12127,7 @@ static void disas_simd_3same_int(DisasContext *s, uint32_t insn)
         }
     }
     clear_vec_high(s, is_q, rd);
+    gen_trace_reg128_var(s, rd, true);
 }
 
 /* AdvSIMD three same
@@ -12052,6 +12155,10 @@ static void disas_simd_three_reg_same(DisasContext *s, uint32_t insn)
         int rm = extract32(insn, 16, 5);
         int rn = extract32(insn, 5, 5);
         int rd = extract32(insn, 0, 5);
+
+        gen_trace_reg128_var(s, rn, false);
+        gen_trace_reg128_var(s, rm, false);
+        gen_trace_reg128_var(s, rd, false);
         if (opcode == 0x17) {
             if (u || (size == 3 && !is_q)) {
                 unallocated_encoding(s);
@@ -12064,6 +12171,7 @@ static void disas_simd_three_reg_same(DisasContext *s, uint32_t insn)
             }
         }
         handle_simd_3same_pair(s, is_q, u, opcode, size, rn, rm, rd);
+        gen_trace_reg128_var(s, rd, true);
         break;
     }
     case 0x18 ... 0x31:
@@ -12152,6 +12260,10 @@ static void disas_simd_three_reg_same_fp16(DisasContext *s, uint32_t insn)
     }
 
     fpst = fpstatus_ptr(FPST_FPCR_F16);
+
+    gen_trace_reg128_var(s, rn, false);
+    gen_trace_reg128_var(s, rm, false);
+    gen_trace_reg128_var(s, rd, false);
 
     if (pairwise) {
         int maxpass = is_q ? 8 : 4;
@@ -12286,6 +12398,7 @@ static void disas_simd_three_reg_same_fp16(DisasContext *s, uint32_t insn)
     tcg_temp_free_ptr(fpst);
 
     clear_vec_high(s, is_q, rd);
+    gen_trace_reg128_var(s, rd, true);
 }
 
 /* AdvSIMD three same extra
@@ -12306,6 +12419,9 @@ static void disas_simd_three_reg_same_extra(DisasContext *s, uint32_t insn)
     bool feature;
     int rot;
 
+    gen_trace_reg128_var(s, rn, false);
+    gen_trace_reg128_var(s, rm, false);
+    gen_trace_reg128_var(s, rd, false);
     switch (u * 16 + opcode) {
     case 0x10: /* SQRDMLAH (vector) */
     case 0x11: /* SQRDMLSH (vector) */
@@ -12386,28 +12502,34 @@ static void disas_simd_three_reg_same_extra(DisasContext *s, uint32_t insn)
     switch (opcode) {
     case 0x0: /* SQRDMLAH (vector) */
         gen_gvec_fn3(s, is_q, rd, rn, rm, gen_gvec_sqrdmlah_qc, size);
+        gen_trace_reg128_var(s, rd, true);
         return;
 
     case 0x1: /* SQRDMLSH (vector) */
         gen_gvec_fn3(s, is_q, rd, rn, rm, gen_gvec_sqrdmlsh_qc, size);
+        gen_trace_reg128_var(s, rd, true);
         return;
 
     case 0x2: /* SDOT / UDOT */
         gen_gvec_op4_ool(s, is_q, rd, rn, rm, rd, 0,
                          u ? gen_helper_gvec_udot_b : gen_helper_gvec_sdot_b);
+        gen_trace_reg128_var(s, rd, true);
         return;
 
     case 0x3: /* USDOT */
         gen_gvec_op4_ool(s, is_q, rd, rn, rm, rd, 0, gen_helper_gvec_usdot_b);
+        gen_trace_reg128_var(s, rd, true);
         return;
 
     case 0x04: /* SMMLA, UMMLA */
         gen_gvec_op4_ool(s, 1, rd, rn, rm, rd, 0,
                          u ? gen_helper_gvec_ummla_b
                          : gen_helper_gvec_smmla_b);
+        gen_trace_reg128_var(s, rd, true);
         return;
     case 0x05: /* USMMLA */
         gen_gvec_op4_ool(s, 1, rd, rn, rm, rd, 0, gen_helper_gvec_usmmla_b);
+        gen_trace_reg128_var(s, rd, true);
         return;
 
     case 0x8: /* FCMLA, #0 */
@@ -12431,6 +12553,7 @@ static void disas_simd_three_reg_same_extra(DisasContext *s, uint32_t insn)
         default:
             g_assert_not_reached();
         }
+        gen_trace_reg128_var(s, rd, true);
         return;
 
     case 0xc: /* FCADD, #90 */
@@ -12452,6 +12575,7 @@ static void disas_simd_three_reg_same_extra(DisasContext *s, uint32_t insn)
         default:
             g_assert_not_reached();
         }
+        gen_trace_reg128_var(s, rd, true);
         return;
 
     case 0xd: /* BFMMLA */
@@ -12469,6 +12593,7 @@ static void disas_simd_three_reg_same_extra(DisasContext *s, uint32_t insn)
         default:
             g_assert_not_reached();
         }
+        gen_trace_reg128_var(s, rd, true);
         return;
 
     default:
@@ -12719,6 +12844,8 @@ static void disas_simd_two_reg_misc(DisasContext *s, uint32_t insn)
     TCGv_i32 tcg_rmode;
     TCGv_ptr tcg_fpstatus;
 
+    gen_trace_reg128_var(s, rn, false);
+    gen_trace_reg128_var(s, rd, false);
     switch (opcode) {
     case 0x0: /* REV64, REV32 */
     case 0x1: /* REV16 */
@@ -12748,6 +12875,7 @@ static void disas_simd_two_reg_misc(DisasContext *s, uint32_t insn)
         }
 
         handle_2misc_narrow(s, false, opcode, u, is_q, size, rn, rd);
+        gen_trace_reg128_var(s, rd, true);
         return;
     case 0x4: /* CLS, CLZ */
         if (size == 3) {
@@ -12765,6 +12893,7 @@ static void disas_simd_two_reg_misc(DisasContext *s, uint32_t insn)
             return;
         }
         handle_2misc_pairwise(s, opcode, u, is_q, size, rn, rd);
+        gen_trace_reg128_var(s, rd, true);
         return;
     case 0x13: /* SHLL, SHLL2 */
         if (u == 0 || size == 3) {
@@ -12775,6 +12904,7 @@ static void disas_simd_two_reg_misc(DisasContext *s, uint32_t insn)
             return;
         }
         handle_shll(s, is_q, size, rn, rd);
+        gen_trace_reg128_var(s, rd, true);
         return;
     case 0xa: /* CMLT */
         if (u == 1) {
@@ -12799,6 +12929,7 @@ static void disas_simd_two_reg_misc(DisasContext *s, uint32_t insn)
             return;
         }
         handle_2misc_satacc(s, false, u, is_q, size, rn, rd);
+        gen_trace_reg128_var(s, rd, true);
         return;
     case 0x7: /* SQABS, SQNEG */
         if (size == 3 && !is_q) {
@@ -12836,6 +12967,7 @@ static void disas_simd_two_reg_misc(DisasContext *s, uint32_t insn)
                 return;
             }
             handle_simd_intfp_conv(s, rd, rn, elements, is_signed, 0, size);
+            gen_trace_reg128_var(s, rd, true);
             return;
         }
         case 0x2c: /* FCMGT (zero) */
@@ -12848,6 +12980,7 @@ static void disas_simd_two_reg_misc(DisasContext *s, uint32_t insn)
                 return;
             }
             handle_2misc_fcmp_zero(s, opcode, false, u, is_q, size, rn, rd);
+            gen_trace_reg128_var(s, rd, true);
             return;
         case 0x7f: /* FSQRT */
             if (size == 3 && !is_q) {
@@ -12897,6 +13030,7 @@ static void disas_simd_two_reg_misc(DisasContext *s, uint32_t insn)
                 return;
             }
             handle_2misc_reciprocal(s, opcode, false, u, is_q, size, rn, rd);
+            gen_trace_reg128_var(s, rd, true);
             return;
         case 0x56: /* FCVTXN, FCVTXN2 */
             if (size == 2) {
@@ -12912,6 +13046,7 @@ static void disas_simd_two_reg_misc(DisasContext *s, uint32_t insn)
                 return;
             }
             handle_2misc_narrow(s, false, opcode, 0, is_q, size - 1, rn, rd);
+            gen_trace_reg128_var(s, rd, true);
             return;
         case 0x36: /* BFCVTN, BFCVTN2 */
             if (!dc_isar_feature(aa64_bf16, s) || size != 2) {
@@ -12922,12 +13057,14 @@ static void disas_simd_two_reg_misc(DisasContext *s, uint32_t insn)
                 return;
             }
             handle_2misc_narrow(s, false, opcode, 0, is_q, size - 1, rn, rd);
+            gen_trace_reg128_var(s, rd, true);
             return;
         case 0x17: /* FCVTL, FCVTL2 */
             if (!fp_access_check(s)) {
                 return;
             }
             handle_2misc_widening(s, opcode, is_q, size, rn, rd);
+            gen_trace_reg128_var(s, rd, true);
             return;
         case 0x18: /* FRINTN */
         case 0x19: /* FRINTM */
@@ -13003,6 +13140,7 @@ static void disas_simd_two_reg_misc(DisasContext *s, uint32_t insn)
     case 0x5:
         if (u && size == 0) { /* NOT */
             gen_gvec_fn2(s, is_q, rd, rn, tcg_gen_gvec_not, 0);
+            gen_trace_reg128_var(s, rd, true);
             return;
         }
         break;
@@ -13012,6 +13150,7 @@ static void disas_simd_two_reg_misc(DisasContext *s, uint32_t insn)
         } else {
             gen_gvec_fn2(s, is_q, rd, rn, gen_gvec_cgt0, size);
         }
+        gen_trace_reg128_var(s, rd, true);
         return;
     case 0x9: /* CMEQ, CMLE */
         if (u) {
@@ -13019,9 +13158,11 @@ static void disas_simd_two_reg_misc(DisasContext *s, uint32_t insn)
         } else {
             gen_gvec_fn2(s, is_q, rd, rn, gen_gvec_ceq0, size);
         }
+        gen_trace_reg128_var(s, rd, true);
         return;
     case 0xa: /* CMLT */
         gen_gvec_fn2(s, is_q, rd, rn, gen_gvec_clt0, size);
+        gen_trace_reg128_var(s, rd, true);
         return;
     case 0xb:
         if (u) { /* ABS, NEG */
@@ -13029,6 +13170,7 @@ static void disas_simd_two_reg_misc(DisasContext *s, uint32_t insn)
         } else {
             gen_gvec_fn2(s, is_q, rd, rn, tcg_gen_gvec_abs, size);
         }
+        gen_trace_reg128_var(s, rd, true);
         return;
     }
 
@@ -13197,6 +13339,7 @@ static void disas_simd_two_reg_misc(DisasContext *s, uint32_t insn)
     if (need_fpstatus) {
         tcg_temp_free_ptr(tcg_fpstatus);
     }
+    gen_trace_reg128_var(s, rd, true);
 }
 
 /* AdvSIMD [scalar] two register miscellaneous (FP16)
@@ -13245,6 +13388,8 @@ static void disas_simd_two_reg_misc_fp16(DisasContext *s, uint32_t insn)
     fpop = deposit32(opcode, 5, 1, a);
     fpop = deposit32(fpop, 6, 1, u);
 
+    gen_trace_reg128_var(s, rn, false);
+    gen_trace_reg128_var(s, rd, false);
     switch (fpop) {
     case 0x1d: /* SCVTF */
     case 0x5d: /* UCVTF */
@@ -13261,6 +13406,7 @@ static void disas_simd_two_reg_misc_fp16(DisasContext *s, uint32_t insn)
             return;
         }
         handle_simd_intfp_conv(s, rd, rn, elements, !u, 0, MO_16);
+        gen_trace_reg128_var(s, rd, true);
         return;
     }
     break;
@@ -13270,6 +13416,7 @@ static void disas_simd_two_reg_misc_fp16(DisasContext *s, uint32_t insn)
     case 0x6c: /* FCMGE (zero) */
     case 0x6d: /* FCMLE (zero) */
         handle_2misc_fcmp_zero(s, fpop, is_scalar, 0, is_q, MO_16, rn, rd);
+        gen_trace_reg128_var(s, rd, true);
         return;
     case 0x3d: /* FRECPE */
     case 0x3f: /* FRECPX */
@@ -13493,6 +13640,7 @@ static void disas_simd_two_reg_misc_fp16(DisasContext *s, uint32_t insn)
     if (tcg_fpstatus) {
         tcg_temp_free_ptr(tcg_fpstatus);
     }
+    gen_trace_reg128_var(s, rd, true);
 }
 
 /* AdvSIMD scalar x indexed element
@@ -13533,6 +13681,9 @@ static void disas_simd_indexed(DisasContext *s, uint32_t insn)
     int index;
     TCGv_ptr fpst;
 
+    gen_trace_reg128_var(s, rn, false);
+    gen_trace_reg128_var(s, rm, false);
+    gen_trace_reg128_var(s, rd, false);
     switch (16 * u + opcode) {
     case 0x08: /* MUL */
     case 0x10: /* MLA */
@@ -13725,24 +13876,29 @@ static void disas_simd_indexed(DisasContext *s, uint32_t insn)
         gen_gvec_op4_ool(s, is_q, rd, rn, rm, rd, index,
                          u ? gen_helper_gvec_udot_idx_b
                          : gen_helper_gvec_sdot_idx_b);
+        gen_trace_reg128_var(s, rd, true);
         return;
     case 0x0f:
         switch (extract32(insn, 22, 2)) {
         case 0: /* SUDOT */
             gen_gvec_op4_ool(s, is_q, rd, rn, rm, rd, index,
                              gen_helper_gvec_sudot_idx_b);
+        gen_trace_reg128_var(s, rd, true);
             return;
         case 1: /* BFDOT */
             gen_gvec_op4_ool(s, is_q, rd, rn, rm, rd, index,
                              gen_helper_gvec_bfdot_idx);
+            gen_trace_reg128_var(s, rd, true);
             return;
         case 2: /* USDOT */
             gen_gvec_op4_ool(s, is_q, rd, rn, rm, rd, index,
                              gen_helper_gvec_usdot_idx_b);
+            gen_trace_reg128_var(s, rd, true);
             return;
         case 3: /* BFMLAL{B,T} */
             gen_gvec_op4_fpst(s, 1, rd, rn, rm, rd, 0, (index << 1) | is_q,
                               gen_helper_gvec_bfmlal_idx);
+            gen_trace_reg128_var(s, rd, true);
             return;
         }
         g_assert_not_reached();
@@ -13763,6 +13919,7 @@ static void disas_simd_indexed(DisasContext *s, uint32_t insn)
                                : gen_helper_gvec_fcmlah_idx);
             tcg_temp_free_ptr(fpst);
         }
+        gen_trace_reg128_var(s, rd, true);
         return;
 
     case 0x00: /* FMLAL */
@@ -13779,6 +13936,7 @@ static void disas_simd_indexed(DisasContext *s, uint32_t insn)
                                is_q ? 16 : 8, vec_full_reg_size(s),
                                data, gen_helper_gvec_fmlal_idx_a64);
         }
+        gen_trace_reg128_var(s, rd, true);
         return;
 
     case 0x08: /* MUL */
@@ -13793,6 +13951,7 @@ static void disas_simd_indexed(DisasContext *s, uint32_t insn)
                                vec_full_reg_offset(s, rm),
                                is_q ? 16 : 8, vec_full_reg_size(s),
                                index, fns[size - 1]);
+            gen_trace_reg128_var(s, rd, true);
             return;
         }
         break;
@@ -13810,6 +13969,7 @@ static void disas_simd_indexed(DisasContext *s, uint32_t insn)
                                vec_full_reg_offset(s, rd),
                                is_q ? 16 : 8, vec_full_reg_size(s),
                                index, fns[size - 1]);
+            gen_trace_reg128_var(s, rd, true);
             return;
         }
         break;
@@ -13827,6 +13987,7 @@ static void disas_simd_indexed(DisasContext *s, uint32_t insn)
                                vec_full_reg_offset(s, rd),
                                is_q ? 16 : 8, vec_full_reg_size(s),
                                index, fns[size - 1]);
+            gen_trace_reg128_var(s, rd, true);
             return;
         }
         break;
@@ -14222,6 +14383,7 @@ static void disas_simd_indexed(DisasContext *s, uint32_t insn)
     if (fpst) {
         tcg_temp_free_ptr(fpst);
     }
+    gen_trace_reg128_var(s, rd, true);
 }
 
 /* Crypto AES

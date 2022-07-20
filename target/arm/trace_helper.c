@@ -92,6 +92,13 @@ OperandInfo * load_store_reg(uint32_t reg, uint32_t val, int ls) {
     return build_load_store_reg_op(name, ls, &val, sizeof(val));
 }
 
+OperandInfo *load_store_reg128(uint32_t reg, uint64_t val_hi, uint64_t val_lo, int ls) {
+    char *name;
+    name = g_strdup_printf("V%u", (unsigned int)reg);
+    uint64_t val[2] = {val_lo, val_hi};
+    return build_load_store_reg_op(name, ls, &val, sizeof(val));
+}
+
 OperandInfo *load_store_reg64(uint32_t reg, uint64_t val, int ls) {
     char *name;
     if (reg >= REG64_D0) {
@@ -163,6 +170,21 @@ void HELPER(trace_store_reg64)(uint32_t reg, uint64_t val)
     OperandInfo *oi = load_store_reg64(reg, val, 1);
     qemu_trace_add_operand(oi, 0x2);
 }
+
+void HELPER(trace_load_reg128)(uint32_t reg, uint64_t val_hi, uint64_t val_lo)
+{
+    qemu_log("This 128-bit register (%d) was read. Value 0x %llx %llx\n", reg, (unsigned long long)val_hi, (unsigned long long)val_lo);
+    OperandInfo *oi = load_store_reg128(reg, val_hi, val_lo, 0);
+    qemu_trace_add_operand(oi, 0x1);
+}
+
+void HELPER(trace_store_reg128)(uint32_t reg, uint64_t val_hi, uint64_t val_lo)
+{
+    qemu_log("This 128-bit register (%d) was written. Value 0x %llx %llx\n", reg, (unsigned long long)val_hi, (unsigned long long)val_lo);
+    OperandInfo *oi = load_store_reg128(reg, val_hi, val_lo, 1);
+    qemu_trace_add_operand(oi, 0x2);
+}
+
 
 void HELPER(trace_ld)(CPUARMState *env, uint32_t val, uint32_t addr, uint32_t opc)
 {
@@ -248,4 +270,5 @@ void HELPER(trace_st64_64)(CPUARMState *env, uint64_t val, uint64_t addr, uint32
     OperandInfo *oi = load_store_mem(addr, 1, &val, sz);
     qemu_trace_add_operand(oi, 0x2);
 }
+
 #endif
