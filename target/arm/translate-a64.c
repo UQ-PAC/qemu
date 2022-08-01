@@ -1116,6 +1116,7 @@ static void do_fp_ld(DisasContext *s, int destidx, TCGv_i64 tcg_addr, int size)
     if (size < 4) {
         mop = finalize_memop(s, size);
         tcg_gen_qemu_ld_i64(tmplo, tcg_addr, get_mem_index(s), mop);
+        gen_trace_mem_access_atomic(tcg_addr, get_mem_index(s), MO_64, false);
     } else {
         bool be = s->be_data == MO_BE;
         TCGv_i64 tcg_hiaddr;
@@ -1126,9 +1127,15 @@ static void do_fp_ld(DisasContext *s, int destidx, TCGv_i64 tcg_addr, int size)
         mop = s->be_data | MO_UQ;
         tcg_gen_qemu_ld_i64(be ? tmphi : tmplo, tcg_addr, get_mem_index(s),
                             mop | (s->align_mem ? MO_ALIGN_16 : 0));
+        gen_trace_mem_access_atomic(tcg_addr,
+                            get_mem_index(s),
+                            mop | (s->align_mem ? MO_ALIGN_16 : 0), false);
         tcg_gen_addi_i64(tcg_hiaddr, tcg_addr, 8);
         tcg_gen_qemu_ld_i64(be ? tmplo : tmphi, tcg_hiaddr,
                             get_mem_index(s), mop);
+        gen_trace_mem_access_atomic(tcg_hiaddr,
+                            get_mem_index(s),
+                            mop, false);
         tcg_temp_free_i64(tcg_hiaddr);
     }
 
@@ -1139,7 +1146,9 @@ static void do_fp_ld(DisasContext *s, int destidx, TCGv_i64 tcg_addr, int size)
         tcg_gen_st_i64(tmphi, cpu_env, fp_reg_hi_offset(s, destidx));
         tcg_temp_free_i64(tmphi);
     }
+
     clear_vec_high(s, tmphi != NULL, destidx);
+    gen_trace_reg128_var(s, destidx, true);
 }
 
 /*
