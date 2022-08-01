@@ -4761,6 +4761,7 @@ static void disas_movw_imm(DisasContext *s, uint32_t insn)
         tcg_gen_movi_i64(tcg_rd, imm);
         break;
     case 3: /* MOVK */
+        gen_trace_load_reg(rd, false);
         tcg_gen_deposit_i64(tcg_rd, tcg_rd, tcg_constant_i64(imm), pos, 16);
         if (!sf) {
             tcg_gen_ext32u_i64(tcg_rd, tcg_rd);
