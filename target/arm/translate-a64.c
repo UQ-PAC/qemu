@@ -1078,10 +1078,13 @@ static void do_fp_st(DisasContext *s, int srcidx, TCGv_i64 tcg_addr, int size)
     MemOp mop;
 
     tcg_gen_ld_i64(tmplo, cpu_env, fp_reg_offset(s, srcidx, MO_64));
+    gen_trace_reg128_var(s, srcidx, false);
 
     if (size < 4) {
         mop = finalize_memop(s, size);
         tcg_gen_qemu_st_i64(tmplo, tcg_addr, get_mem_index(s), mop);
+
+        gen_trace_mem_access_atomic(tcg_addr, get_mem_index(s), MO_64, true);
     } else {
         bool be = s->be_data == MO_BE;
         TCGv_i64 tcg_hiaddr = tcg_temp_new_i64();
@@ -1092,9 +1095,19 @@ static void do_fp_st(DisasContext *s, int srcidx, TCGv_i64 tcg_addr, int size)
         mop = s->be_data | MO_UQ;
         tcg_gen_qemu_st_i64(be ? tmphi : tmplo, tcg_addr, get_mem_index(s),
                             mop | (s->align_mem ? MO_ALIGN_16 : 0));
+        gen_trace_mem_access_atomic(tcg_addr,
+                            get_mem_index(s),
+                            mop | (s->align_mem ? MO_ALIGN_16 : 0), true);
+
+        // calculate high addr
         tcg_gen_addi_i64(tcg_hiaddr, tcg_addr, 8);
         tcg_gen_qemu_st_i64(be ? tmplo : tmphi, tcg_hiaddr,
                             get_mem_index(s), mop);
+
+        gen_trace_mem_access_atomic(tcg_hiaddr,
+                            get_mem_index(s),
+                            mop, true);
+
 
         tcg_temp_free_i64(tcg_hiaddr);
         tcg_temp_free_i64(tmphi);
@@ -1130,12 +1143,15 @@ static void do_fp_ld(DisasContext *s, int destidx, TCGv_i64 tcg_addr, int size)
         gen_trace_mem_access_atomic(tcg_addr,
                             get_mem_index(s),
                             mop | (s->align_mem ? MO_ALIGN_16 : 0), false);
+
+        // calculate high addr
         tcg_gen_addi_i64(tcg_hiaddr, tcg_addr, 8);
         tcg_gen_qemu_ld_i64(be ? tmplo : tmphi, tcg_hiaddr,
                             get_mem_index(s), mop);
         gen_trace_mem_access_atomic(tcg_hiaddr,
                             get_mem_index(s),
                             mop, false);
+
         tcg_temp_free_i64(tcg_hiaddr);
     }
 
@@ -1269,9 +1285,14 @@ static void do_vec_st(DisasContext *s, int srcidx, int element,
                       TCGv_i64 tcg_addr, MemOp mop)
 {
     TCGv_i64 tcg_tmp = tcg_temp_new_i64();
+    gen_trace_reg128_var(s, srcidx, false);
 
     read_vec_element(s, tcg_tmp, srcidx, element, mop & MO_SIZE);
     tcg_gen_qemu_st_i64(tcg_tmp, tcg_addr, get_mem_index(s), mop);
+
+    gen_trace_mem_access_atomic(tcg_addr,
+                            get_mem_index(s),
+                            mop, true);
 
     tcg_temp_free_i64(tcg_tmp);
 }
@@ -1282,8 +1303,14 @@ static void do_vec_ld(DisasContext *s, int destidx, int element,
 {
     TCGv_i64 tcg_tmp = tcg_temp_new_i64();
 
+    gen_trace_mem_access_atomic(tcg_addr,
+                            get_mem_index(s),
+                            mop, false);
+
     tcg_gen_qemu_ld_i64(tcg_tmp, tcg_addr, get_mem_index(s), mop);
     write_vec_element(s, tcg_tmp, destidx, element, mop & MO_SIZE);
+
+    gen_trace_reg128_var(s, destidx, true);
 
     tcg_temp_free_i64(tcg_tmp);
 }
